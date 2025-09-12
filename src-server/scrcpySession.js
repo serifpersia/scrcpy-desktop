@@ -6,136 +6,13 @@ const { log } = require('./logger');
 const C = require('./constants');
 const adbService = require('./adbService');
 
+const nativeModule = require('./native/build/Release/scrcpy_native');
+
+const parseSPS = nativeModule.parseSPS;
+const parseAudioSpecificConfig = nativeModule.parseAudioSpecificConfig;
+
 const sessions = new Map();
 const workers = new Map();
-
-class BitReader {
-	constructor(buffer) {
-		this.buffer = buffer; this.bytePosition = 0; this.bitPosition = 0;
-	}
-	readBits(n) {
-		if (n === 0) return 0; if (n > 32) return null;
-		let result = 0;
-		for (let i = 0; i < n; i++) {
-			if (this.bytePosition >= this.buffer.length) return null;
-			result <<= 1; result |= (this.buffer[this.bytePosition] >> (7 - this.bitPosition)) & 1;
-			this.bitPosition++;
-			if (this.bitPosition === 8) { this.bitPosition = 0; this.bytePosition++; }
-		}
-		return result;
-	}
-	readUE() {
-		let leadingZeroBits = 0;
-		while (this.readBits(1) === 0) { leadingZeroBits++; if (leadingZeroBits > 31) return null; }
-		if (leadingZeroBits === 0) return 0;
-		const valueSuffix = this.readBits(leadingZeroBits); if (valueSuffix === null) return null;
-		return (1 << leadingZeroBits) - 1 + valueSuffix;
-	}
-	readSE() {
-		const codeNum = this.readUE(); if (codeNum === null) return null;
-		return (codeNum % 2 === 0) ? -(codeNum / 2) : (codeNum + 1) / 2;
-	}
-	readBool() {
-		const bit = this.readBits(1); if (bit === null) return null; return bit === 1;
-	}
-}
-
-function parseSPS(naluBufferWithStartCode) {
-	if (!naluBufferWithStartCode || naluBufferWithStartCode.length < 1) return null;
-	let offset = 0;
-    if (naluBufferWithStartCode.length >= 4 && naluBufferWithStartCode[0] === 0 && naluBufferWithStartCode[1] === 0 && naluBufferWithStartCode[2] === 0 && naluBufferWithStartCode[3] === 1) {
-        offset = 4;
-    } else if (naluBufferWithStartCode.length >= 3 && naluBufferWithStartCode[0] === 0 && naluBufferWithStartCode[1] === 0 && naluBufferWithStartCode[2] === 1) {
-        offset = 3;
-    }
-
-	const rbspBuffer = naluBufferWithStartCode.subarray(offset); if (rbspBuffer.length < 4) return null;
-	const nal_unit_type = rbspBuffer[0] & 0x1F; if (nal_unit_type !== 7) return null;
-    
-    const profile_idc_val = rbspBuffer[1];
-    const profile_compatibility_val = rbspBuffer[2];
-    const level_idc_val = rbspBuffer[3];
-
-	const reader = new BitReader(rbspBuffer.subarray(1)); 
-	try {
-		const profile_idc = reader.readBits(8); 
-        const constraint_set_flags = reader.readBits(8); 
-        const level_idc = reader.readBits(8); 
-        reader.readUE(); 
-
-		if (profile_idc === null) return null;
-		let chroma_format_idc = 1, separate_colour_plane_flag = 0;
-		if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(profile_idc)) {
-			chroma_format_idc = reader.readUE(); if (chroma_format_idc === null || chroma_format_idc > 3) return null;
-			if (chroma_format_idc === 3) { separate_colour_plane_flag = reader.readBool(); if (separate_colour_plane_flag === null) return null; }
-			reader.readUE(); 
-            reader.readUE(); 
-            reader.readBool(); 
-			const seq_scaling_matrix_present_flag = reader.readBool(); if (seq_scaling_matrix_present_flag === null) return null;
-			if (seq_scaling_matrix_present_flag) {
-				const limit = (chroma_format_idc !== 3) ? 8 : 12;
-				for (let i = 0; i < limit; i++) {
-					if (reader.readBool()) {
-						const sizeOfScalingList = (i < 6) ? 16 : 64; let lastScale = 8, nextScale = 8;
-						for (let j = 0; j < sizeOfScalingList; j++) {
-							if (nextScale !== 0) { const delta_scale = reader.readSE(); if (delta_scale === null) return null; nextScale = (lastScale + delta_scale + 256) % 256; }
-							lastScale = (nextScale === 0) ? lastScale : nextScale;
-						}}}}
-		}
-		reader.readUE(); 
-        const pic_order_cnt_type = reader.readUE(); if (pic_order_cnt_type === null) return null;
-		if (pic_order_cnt_type === 0) reader.readUE(); 
-		else if (pic_order_cnt_type === 1) {
-			reader.readBool(); 
-            reader.readSE(); 
-            reader.readSE(); 
-			const num_ref_frames_in_pic_order_cnt_cycle = reader.readUE(); if (num_ref_frames_in_pic_order_cnt_cycle === null) return null;
-			for (let i = 0; i < num_ref_frames_in_pic_order_cnt_cycle; i++) reader.readSE();
-		}
-		reader.readUE(); 
-        reader.readBool(); 
-		const pic_width_in_mbs_minus1 = reader.readUE(); const pic_height_in_map_units_minus1 = reader.readUE(); const frame_mbs_only_flag = reader.readBool();
-		if (pic_width_in_mbs_minus1 === null || pic_height_in_map_units_minus1 === null || frame_mbs_only_flag === null) return null;
-		if (!frame_mbs_only_flag) reader.readBool(); 
-        reader.readBool(); 
-		const frame_cropping_flag = reader.readBool(); if (frame_cropping_flag === null) return null;
-		let frame_crop_left_offset = 0, frame_crop_right_offset = 0, frame_crop_top_offset = 0, frame_crop_bottom_offset = 0;
-		if (frame_cropping_flag) {
-			frame_crop_left_offset = reader.readUE(); frame_crop_right_offset = reader.readUE(); frame_crop_top_offset = reader.readUE(); frame_crop_bottom_offset = reader.readUE();
-			if (frame_crop_left_offset === null || frame_crop_right_offset === null || frame_crop_top_offset === null || frame_crop_bottom_offset === null) return null;
-		}
-		const pic_width_in_mbs = pic_width_in_mbs_minus1 + 1; const pic_height_in_map_units = pic_height_in_map_units_minus1 + 1;
-		const frame_height_in_mbs = (2 - (frame_mbs_only_flag ? 1 : 0)) * pic_height_in_map_units;
-		let width = pic_width_in_mbs * 16, height = frame_height_in_mbs * 16;
-		if (frame_cropping_flag) {
-			let subWidthC = 1, subHeightC = 1;
-			if (separate_colour_plane_flag) {} else if (chroma_format_idc === 1) { subWidthC = 2; subHeightC = 2; }
-			else if (chroma_format_idc === 2) { subWidthC = 2; subHeightC = 1; }
-			const cropUnitX = subWidthC; const cropUnitY = subHeightC * (2 - (frame_mbs_only_flag ? 1 : 0));
-			width -= (frame_crop_left_offset + frame_crop_right_offset) * cropUnitX;
-			height -= (frame_crop_top_offset + frame_crop_bottom_offset) * cropUnitY;
-		}
-		return { width, height, profile_idc: profile_idc_val, profile_compatibility: profile_compatibility_val, level_idc: level_idc_val };
-	} catch (e) { log(C.LogLevel.WARN, `Error parsing SPS: ${e.message}`); return null; }
-}
-
-function parseAudioSpecificConfig(buffer) {
-    if (!buffer || buffer.length === 0) return null;
-    let offset = 0, bits = 0, bitCount = 0;
-	function readBits(numBits) {
-		while (bitCount < numBits) { bits = (bits << 8) | buffer[offset++]; bitCount += 8; }
-		bitCount -= numBits; const result = (bits >> bitCount) & ((1 << numBits) - 1);
-		bits &= (1 << bitCount) - 1; return result;
-	}
-	const objectType = readBits(5); let sampleRateIndex = readBits(4);
-	let sampleRate = C.SAMPLE_RATE_MAP[sampleRateIndex];
-	if (sampleRateIndex === 15) sampleRate = readBits(24);
-	const channelConfig = readBits(4);
-	if (!C.PROFILE_MAP[objectType]) throw new Error(`Unsupported AAC object type: ${objectType}`);
-	if (!sampleRate) throw new Error(`Unsupported sample rate index: ${sampleRateIndex}`);
-	if (channelConfig < 1 || channelConfig > 7) throw new Error(`Unsupported channel configuration: ${channelConfig}`);
-	return { profile: C.PROFILE_MAP[objectType], sampleRateIndex, sampleRate, channelConfig, rawASC: buffer };
-}
 
 function _handleAwaitingInitialData(socket, dynBuffer, session, client) {
     if (!session.deviceNameReceived) {
@@ -208,147 +85,16 @@ function _handleAwaitingMetadata(socket, dynBuffer, session, client) {
     }
 }
 
-function extractNaluPayload(naluWithStartCode) {
-    if (!naluWithStartCode || naluWithStartCode.length < 3) return naluWithStartCode;
-    if (naluWithStartCode[0] === 0 && naluWithStartCode[1] === 0) {
-        if (naluWithStartCode[2] === 1) return naluWithStartCode.subarray(3);
-        if (naluWithStartCode.length > 3 && naluWithStartCode[2] === 0 && naluWithStartCode[3] === 1) return naluWithStartCode.subarray(4);
-    }
-    return naluWithStartCode; 
-}
-
-function extractSingleNalu(buffer, naluTypeToFind) {
-    let offset = 0;
-    const pattern3Byte = Buffer.from([0x00, 0x00, 0x01]);
-    const pattern4Byte = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-
-    while (offset < buffer.length) {
-        let startCodeOffset = -1;
-        let startCodeLength = 0;
-
-        let idx4 = buffer.indexOf(pattern4Byte, offset);
-        let idx3 = buffer.indexOf(pattern3Byte, offset);
-
-        if (idx4 !== -1 && (idx3 === -1 || idx4 < idx3)) {
-            startCodeOffset = idx4;
-            startCodeLength = 4;
-        } else if (idx3 !== -1) {
-            startCodeOffset = idx3;
-            startCodeLength = 3;
-        } else {
-            break; 
-        }
-        
-        if (startCodeOffset + startCodeLength >= buffer.length) break;
-
-        const currentNaluType = buffer[startCodeOffset + startCodeLength] & 0x1F;
-        if (currentNaluType === naluTypeToFind) {
-            let nextNaluStart = -1;
-            let nextIdx4 = buffer.indexOf(pattern4Byte, startCodeOffset + startCodeLength);
-            let nextIdx3 = buffer.indexOf(pattern3Byte, startCodeOffset + startCodeLength);
-
-            if (nextIdx4 !== -1 && (nextIdx3 === -1 || nextIdx4 < nextIdx3)) {
-                nextNaluStart = nextIdx4;
-            } else if (nextIdx3 !== -1) {
-                nextNaluStart = nextIdx3;
-            }
-
-            if (nextNaluStart !== -1) {
-                return buffer.subarray(startCodeOffset, nextNaluStart);
-            } else {
-                return buffer.subarray(startCodeOffset); 
-            }
-        }
-        offset = startCodeOffset + startCodeLength; 
-    }
-    return null;
-}
+const extractNaluPayload = nativeModule.extractNaluPayload;
+const extractSingleNalu = nativeModule.extractSingleNalu;
 
 
-function createAVCC(spsNaluWithStartCode, ppsNaluWithStartCode) {
-    if (!spsNaluWithStartCode || !ppsNaluWithStartCode) {
-        log(C.LogLevel.WARN, `createAVCC: SPS or PPS NALU (with start code) is missing.`);
-        return null;
-    }
-
-    const sps = extractNaluPayload(spsNaluWithStartCode);
-    const pps = extractNaluPayload(ppsNaluWithStartCode);
-    
-    if (sps.length === 0 || pps.length === 0) {
-        log(C.LogLevel.WARN, `createAVCC: SPS or PPS data is empty after attempting to strip start codes. Original SPS len: ${spsNaluWithStartCode.length}, PPS len: ${ppsNaluWithStartCode.length}`);
-        return null;
-    }
-     if (sps.length < 4) { 
-        log(C.LogLevel.WARN, `createAVCC: SPS data too short after stripping. Length: ${sps.length}`);
-        return null;
-    }
-
-
-    const avccBox = Buffer.alloc(
-        1 + 3 + 1 + 1 + 2 + sps.length + 1 + 2 + pps.length
-    );
-
-    let offset = 0;
-    avccBox.writeUInt8(1, offset++); 
-    avccBox.writeUInt8(sps[1], offset++); 
-    avccBox.writeUInt8(sps[2], offset++); 
-    avccBox.writeUInt8(sps[3], offset++); 
-    avccBox.writeUInt8(0xFC | 3, offset++); 
-    
-    avccBox.writeUInt8(0xE0 | 1, offset++); 
-    avccBox.writeUInt16BE(sps.length, offset); offset += 2;
-    sps.copy(avccBox, offset); offset += sps.length;
-    
-    avccBox.writeUInt8(1, offset++); 
-    avccBox.writeUInt16BE(pps.length, offset); offset += 2;
-    pps.copy(avccBox, offset); offset += pps.length;
-    
-    return avccBox.subarray(0, offset);
-}
+const createAVCC = nativeModule.createAVCC;
 
 const START_CODE_3 = Buffer.from([0, 0, 1]);
 const START_CODE_4 = Buffer.from([0, 0, 0, 1]);
 
-function annexBToLengthPrefixed(annexBBuffer) {
-    const nalus = [];
-    let offset = 0;
-
-    while (offset < annexBBuffer.length) {
-        let startCodeOffset = -1;
-        let startCodeLength = 0;
-
-        const idx3 = annexBBuffer.indexOf(START_CODE_3, offset);
-        const idx4 = annexBBuffer.indexOf(START_CODE_4, offset);
-
-        if (idx4 !== -1 && (idx3 === -1 || idx4 < idx3)) {
-            startCodeOffset = idx4;
-            startCodeLength = 4;
-        } else if (idx3 !== -1) {
-            startCodeOffset = idx3;
-            startCodeLength = 3;
-        }
-
-        if (startCodeOffset !== -1) {
-            if (startCodeOffset > offset) {
-                nalus.push(annexBBuffer.slice(offset, startCodeOffset));
-            }
-            offset = startCodeOffset + startCodeLength;
-        } else {
-            nalus.push(annexBBuffer.slice(offset));
-            break;
-        }
-    }
-
-    const buffers = [];
-    for (const nalu of nalus) {
-        if (nalu.length === 0) continue;
-        const length = Buffer.alloc(4);
-        length.writeUInt32BE(nalu.length, 0);
-        buffers.push(length, nalu);
-    }
-
-    return Buffer.concat(buffers);
-}
+const annexBToLengthPrefixed = nativeModule.annexBToLengthPrefixed;
 
 function _processVideoStreamPacket(socket, dynBuffer, session, client) {
     if (dynBuffer.length >= C.PACKET_HEADER_LENGTH) {

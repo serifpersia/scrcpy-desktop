@@ -42,6 +42,17 @@ else
 fi
 echo
 
+echo -e "\033[1;33mPackaging for Linux with npm run package:linux...\033[0m"
+npm run package:linux
+if [ $? -ne 0 ]; then
+    echo -e "\033[1;31mError: npm run package:linux failed!\033[0m"
+    read -p "Press Enter to exit..."
+    exit $?
+else
+    echo -e "\033[1;32mSuccess: Packaging for Linux completed!\033[0m"
+fi
+echo
+
 echo -e "\033[1;33mRunning npm start...\033[0m"
 npm start
 if [ $? -ne 0 ]; then

@@ -46,6 +46,17 @@ if %ERRORLEVEL% neq 0 (
 )
 echo.
 
+echo  Packaging for Windows with npm run package:win...
+call npm run package:win
+if %ERRORLEVEL% neq 0 (
+    echo  Error: npm run package:win failed!
+    pause
+    exit /b %ERRORLEVEL%
+) else (
+    echo  Success: Packaging for Windows completed!
+)
+echo.
+
 echo  Running npm start...
 call npm start
 if %ERRORLEVEL% neq 0 (
